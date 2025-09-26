@@ -1,0 +1,65 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Additional caches
+/.vite/
+.vite-cache/
+coverage/
+
+# Env files
+.env
+.env.*
+!.env.example
+src-tauri/.env
+src-tauri/.env.*
+!src-tauri/.env.example
+
+# OS junk
+Thumbs.db
+
+# Bun
+bun.lock
+.bun/
+
+# Vite build output
+/dist/
+
+# Tauri build output (Rust target)
+src-tauri/target/
+src-tauri/**/.fingerprint/
+
+# Installers/bundles
+*.msi
+*.exe
+*.dmg
+*.app
+*.pkg
+*.deb
+*.AppImage
+
+# Misc temp
+*.tmp
+*.temp
+*.bak
