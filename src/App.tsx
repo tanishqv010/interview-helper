@@ -45,6 +45,44 @@ const promptTemplates: Record<string, string> = {
 - Then provide the algorithm and explicit Big-O time and space complexity (Best, Average, Worst) in concise bullet points
 - Finally, output exactly one code block with fully working code (include headers)
 `,
+  "beast-mode": `BEAST MODE ACTIVATED! 🚀
+
+Extract ALL content from the provided images and analyze them comprehensively:
+
+For MCQ Questions:
+- Extract the complete question text
+- Extract ALL options (A, B, C, D, etc.)
+- Identify if it's single-correct or multiple-correct
+- Extract any additional context, diagrams, or formulas
+- Provide the correct answer(s)
+
+For Coding Questions:
+- Extract the complete problem statement
+- Extract all constraints and requirements
+- Extract input format specifications
+- Extract output format specifications
+- Extract all test cases and examples
+- Extract any function signatures or driver code provided
+- Identify the programming language if specified
+
+For Mixed Content:
+- Extract everything systematically
+- Categorize each type of content
+- Provide comprehensive analysis
+
+Output format:
+## Content Analysis
+[Detailed extraction of all text, formulas, diagrams, etc.]
+
+## Question Type
+[MCQ/Coding/Mixed]
+
+## Extracted Content
+[Complete structured extraction]
+
+## Ready for Advanced AI Processing
+[All content formatted for final AI processing]
+`,
 };
 
 export default function App() {
@@ -98,14 +136,27 @@ export default function App() {
     setLoading(true);
     setOutput("");
     try {
-      let finalPrompt = language ? `${prompt}\n\nUse the programming language: ${language}.` : prompt;
-      if (language === "C++") {
-        finalPrompt += "\n\nAdditional requirements for C++:\n- Do NOT use any fast I/O boilerplate (e.g., ios::sync_with_stdio(false), cin.tie(nullptr)).\n- Include 'using namespace std;'.";
+      if (outputFormat === "beast-mode") {
+        // Use BEAST MODE processing
+        let finalPrompt = language ? `${prompt}\n\nUse the programming language: ${language}.` : prompt;
+        if (language === "C++") {
+          finalPrompt += "\n\nAdditional requirements for C++:\n- Do NOT use any fast I/O boilerplate (e.g., ios::sync_with_stdio(false), cin.tie(nullptr)).\n- Include 'using namespace std;'.";
+        }
+        const result = await invoke<string>("call_beast_mode", {
+          prompt: finalPrompt,
+        });
+        setOutput(result);
+      } else {
+        // Use regular processing
+        let finalPrompt = language ? `${prompt}\n\nUse the programming language: ${language}.` : prompt;
+        if (language === "C++") {
+          finalPrompt += "\n\nAdditional requirements for C++:\n- Do NOT use any fast I/O boilerplate (e.g., ios::sync_with_stdio(false), cin.tie(nullptr)).\n- Include 'using namespace std;'.";
+        }
+        const result = await invoke<string>("call_gemini_with_image_queue", {
+          prompt: finalPrompt,
+        });
+        setOutput(result);
       }
-      const result = await invoke<string>("call_gemini_with_image_queue", {
-        prompt: finalPrompt,
-      });
-      setOutput(result);
     } catch (err) {
       setOutput("Error: " + err);
     } finally {
@@ -208,6 +259,23 @@ export default function App() {
       .catch((e) => console.error("Failed to read API key", e));
   }
 
+  function promptForHfToken() {
+    invoke<string | null>("get_hf_token")
+      .then((existing) => {
+        const entered = window.prompt(
+          existing ? "Update Hugging Face Token (leave blank to clear)" : "Set Hugging Face Token for BEAST MODE",
+          existing ?? ""
+        );
+        if (entered === null) return; // cancelled
+        invoke("set_hf_token", { token: entered })
+          .then(() => {
+            console.log(existing ? "Hugging Face token updated" : "Hugging Face token set");
+          })
+          .catch((e) => console.error("Failed to set Hugging Face token", e));
+      })
+      .catch((e) => console.error("Failed to read Hugging Face token", e));
+  }
+
   async function applyModel(newModel: string) {
     try {
       const m = await invoke<string>("set_model", { model: newModel });
@@ -243,7 +311,10 @@ export default function App() {
           Clear (R)
         </Button>
         <Button variant="outline" onClick={promptForApiKey} title="Set Gemini API Key">
-          Set Key
+          Set Gemini Key
+        </Button>
+        <Button variant="outline" onClick={promptForHfToken} title="Set Hugging Face Token for BEAST MODE">
+          Set HuggingFace Key
         </Button>
         <div className="basis-full h-0"></div>
         <select
@@ -284,6 +355,7 @@ export default function App() {
           <option value="multiple-correct-mcq">multiple-correct-mcq</option>
           <option value="code-without-comments">code-without-comments</option>
           <option value="code-with-explanation">code-with-explanation</option>
+          <option value="beast-mode">BEAST MODE!!</option>
         </select>
       </div>
 

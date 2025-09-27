@@ -3,6 +3,8 @@
 use genai::chat::{ChatMessage, ChatRequest, ContentPart};
 use genai::Client;
 use tauri::Manager;
+use reqwest::Client as HttpClient;
+use serde_json::json;
 
 use base64::{engine::general_purpose, Engine as _};
 use image::{ImageBuffer, Rgba};
@@ -42,6 +44,7 @@ struct ImageQueue {
 struct AppConfig {
     api_key: Mutex<Option<String>>, // Stored for reference; env var is also set
     model: Mutex<String>,
+    hf_token: Mutex<Option<String>>, // Hugging Face token for GPT-OSS-120B
 }
 
 #[tauri::command]
@@ -243,6 +246,50 @@ fn set_model(model: String, cfg: tauri::State<'_, AppConfig>) -> Result<String, 
 }
 
 #[tauri::command]
+fn set_hf_token(token: String, cfg: tauri::State<'_, AppConfig>) -> Result<(), String> {
+    let mut hf_token_guard = cfg.hf_token.lock().map_err(|_| "Lock poisoned")?;
+    if token.is_empty() {
+        *hf_token_guard = None;
+        std::env::remove_var("HUGGINGFACE_TOKEN");
+    } else {
+        *hf_token_guard = Some(token.clone());
+        std::env::set_var("HUGGINGFACE_TOKEN", token.clone());
+    }
+
+    // Persist to Windows user environment and broadcast change
+    #[cfg(windows)]
+    {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(env) = hkcu.open_subkey_with_flags("Environment", winreg::enums::KEY_SET_VALUE) {
+            if let Err(e) = env.set_value("HUGGINGFACE_TOKEN", &std::env::var("HUGGINGFACE_TOKEN").unwrap_or_default()) {
+                eprintln!("Failed to write HUGGINGFACE_TOKEN to registry: {}", e);
+            }
+        }
+
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                WPARAM(0),
+                LPARAM(w!("Environment").as_ptr() as isize),
+                SMTO_ABORTIFHUNG,
+                5000,
+                None,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_hf_token(cfg: tauri::State<'_, AppConfig>) -> Option<String> {
+    if let Ok(guard) = cfg.hf_token.lock() {
+        return guard.clone();
+    }
+    None
+}
+
+#[tauri::command]
 async fn call_gemini(prompt: String, cfg: tauri::State<'_, AppConfig>) -> Result<String, String> {
     if std::env::var("GEMINI_API_KEY").is_err() {
         return Err("GEMINI_API_KEY environment variable not set.".to_string());
@@ -402,6 +449,146 @@ async fn call_gemini_with_image_queue(prompt: String, queue: tauri::State<'_, Im
         .to_string())
 }
 
+#[tauri::command]
+async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cfg: tauri::State<'_, AppConfig>) -> Result<String, String> {
+    if std::env::var("GEMINI_API_KEY").is_err() {
+        return Err("GEMINI_API_KEY environment variable not set.".to_string());
+    }
+
+    // Collect image paths and release the lock before async operations
+    let image_paths = {
+        let images = queue.images.lock().unwrap();
+        if images.is_empty() {
+            return Err("No images in queue".to_string());
+        }
+        images.iter().cloned().collect::<Vec<String>>()
+    };
+
+    // Step 1: Use Gemini 2.0 Flash for content extraction
+    let client = Client::default();
+    let mut content_parts = vec![ContentPart::from_text(prompt)];
+
+    // Add all images from the queue
+    for image_path in image_paths.iter() {
+        let mut file = File::open(image_path).map_err(|e| e.to_string())?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+
+        let encoded_image = general_purpose::STANDARD.encode(&buffer);
+        content_parts.push(ContentPart::from_image_base64("image/png", Arc::from(encoded_image)));
+    }
+
+    let chat_req = ChatRequest::new(vec![
+        ChatMessage::system("You are an expert content extractor. Extract ALL text, formulas, diagrams, and structured information from the provided images. Be comprehensive and detailed."),
+        ChatMessage::user(content_parts),
+    ]);
+
+    // Use Gemini 2.0 Flash for extraction
+    let extraction_result = client
+        .exec_chat("gemini-2.0-flash", chat_req, None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let extracted_content = extraction_result
+        .content_text_as_str()
+        .unwrap_or("[No extraction]")
+        .to_string();
+
+        // Step 2: Send extracted content to advanced AI model via Hugging Face API
+    let hf_token = std::env::var("HUGGINGFACE_TOKEN").ok();
+    
+    if let Some(token) = hf_token {
+        let http_client = HttpClient::new();
+        
+        // Prepare the final prompt for advanced AI processing
+        let final_prompt = format!(
+            "Based on the extracted content below, provide comprehensive answers:\n\n{}\n\nFor MCQ questions: Identify all possibilities for single correct and multiple correct answers.\nFor coding questions: Provide complete code solutions in the requested language with proper formatting.",
+            extracted_content
+        );
+
+        // Use a more reliable model endpoint
+        let model_endpoint = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-large";
+        
+        let gpt_response = match http_client
+            .post(model_endpoint)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(120)) // 2 minute timeout
+            .json(&json!({
+                "inputs": final_prompt,
+                "parameters": {
+                    "max_new_tokens": 2048,
+                    "temperature": 0.7,
+                    "return_full_text": false,
+                    "do_sample": true,
+                    "top_p": 0.9
+                }
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            // Handle Hugging Face API response format
+                            if let Some(choices) = json.as_array() {
+                                if let Some(first_choice) = choices.first() {
+                                    if let Some(text) = first_choice["generated_text"].as_str() {
+                                        text.to_string()
+                                    } else {
+                                        "No generated text in response".to_string()
+                                    }
+                                } else {
+                                    "Empty response from AI model".to_string()
+                                }
+                            } else if let Some(text) = json["generated_text"].as_str() {
+                                text.to_string()
+                            } else {
+                                "Unexpected response format from AI model".to_string()
+                            }
+                        }
+                        Err(e) => format!("Error parsing AI model response: {}", e)
+                    }
+                } else {
+                    let status = response.status();
+                    let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                    
+                    // Handle specific error cases
+                    if status == 503 {
+                        format!(
+                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Advanced AI processing is temporarily unavailable (Service Unavailable). The extracted content above contains all the information from your images. You can use this content directly or try again later.",
+                            extracted_content
+                        )
+                    } else if status == 400 {
+                        format!(
+                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Advanced AI processing request format error (Bad Request). The extracted content above contains all the information from your images. You can use this content directly.",
+                            extracted_content
+                        )
+                    } else {
+                        format!("AI model API error ({}): {}", status, error_text)
+                    }
+                }
+            }
+            Err(e) => {
+                // Handle network errors gracefully
+                format!(
+                    "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Network error occurred while connecting to advanced AI processing: {}. The extracted content above contains all the information from your images. You can use this content directly or check your internet connection and try again.",
+                    extracted_content, e
+                )
+            }
+        };
+        
+        Ok(gpt_response)
+    } else {
+        // Fallback: Return the extracted content with a note
+        Ok(format!(
+            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Hugging Face token not configured. The extracted content above contains all the information from your images. Set a Hugging Face token in the app to enable advanced AI processing.",
+            extracted_content
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
@@ -424,6 +611,9 @@ async fn main() {
             set_gemini_api_key,
             get_gemini_api_key,
             set_model,
+            call_beast_mode,
+            set_hf_token,
+            get_hf_token,
         ])
         .setup(|app| {
             // Initialize and manage app-level toggle state
@@ -440,9 +630,11 @@ async fn main() {
             // Initialize runtime configuration
             let initial_model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
             let initial_key = std::env::var("GEMINI_API_KEY").ok();
+            let initial_hf_token = std::env::var("HUGGINGFACE_TOKEN").ok();
             app.manage(AppConfig {
                 api_key: Mutex::new(initial_key),
                 model: Mutex::new(initial_model),
+                hf_token: Mutex::new(initial_hf_token),
             });
             let window = app.get_webview_window("main").unwrap();
             window.set_always_on_top(true)?;
