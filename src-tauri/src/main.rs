@@ -232,9 +232,24 @@ fn set_gemini_api_key(key: String, cfg: tauri::State<'_, AppConfig>) -> Result<(
 
 #[tauri::command]
 fn get_gemini_api_key(cfg: tauri::State<'_, AppConfig>) -> Option<String> {
-    if let Ok(guard) = cfg.api_key.lock() {
-        return guard.clone();
+    // First try to get from environment variable
+    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        if !key.trim().is_empty() {
+            // Update AppConfig to match environment variable
+            if let Ok(mut guard) = cfg.api_key.lock() {
+                *guard = Some(key.clone());
+            }
+            return Some(key);
+        }
     }
+    
+    // If not in environment, try AppConfig
+    if let Ok(guard) = cfg.api_key.lock() {
+        if let Some(key) = guard.clone() {
+            return Some(key);
+        }
+    }
+    
     None
 }
 
@@ -247,13 +262,26 @@ fn set_model(model: String, cfg: tauri::State<'_, AppConfig>) -> Result<String, 
 
 #[tauri::command]
 fn set_hf_token(token: String, cfg: tauri::State<'_, AppConfig>) -> Result<(), String> {
+    // First, check if the environment variable has changed
+    let _env_token = std::env::var("HUGGINGFACE_TOKEN").ok();
     let mut hf_token_guard = cfg.hf_token.lock().map_err(|_| "Lock poisoned")?;
-    if token.is_empty() {
+    
+    // Check if the provided token is different from what's in AppConfig
+    let current_token = hf_token_guard.clone();
+    let token_changed = current_token != Some(token.clone());
+    
+    // If token is empty, clear everything
+    if token.trim().is_empty() {
         *hf_token_guard = None;
         std::env::remove_var("HUGGINGFACE_TOKEN");
     } else {
+        // Update AppConfig with new token
         *hf_token_guard = Some(token.clone());
-        std::env::set_var("HUGGINGFACE_TOKEN", token.clone());
+        
+        // Only update environment variable if token has changed
+        if token_changed {
+            std::env::set_var("HUGGINGFACE_TOKEN", token.clone());
+        }
     }
 
     // Persist to Windows user environment and broadcast change
@@ -261,9 +289,15 @@ fn set_hf_token(token: String, cfg: tauri::State<'_, AppConfig>) -> Result<(), S
     {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         if let Ok(env) = hkcu.open_subkey_with_flags("Environment", winreg::enums::KEY_SET_VALUE) {
-            if let Err(e) = env.set_value("HUGGINGFACE_TOKEN", &std::env::var("HUGGINGFACE_TOKEN").unwrap_or_default()) {
+            let token_value = std::env::var("HUGGINGFACE_TOKEN").unwrap_or_default();
+            println!("DEBUG: Writing HUGGINGFACE_TOKEN to registry: {}", &token_value[..std::cmp::min(10, token_value.len())]);
+            if let Err(e) = env.set_value("HUGGINGFACE_TOKEN", &token_value) {
                 eprintln!("Failed to write HUGGINGFACE_TOKEN to registry: {}", e);
+            } else {
+                println!("DEBUG: Successfully wrote HUGGINGFACE_TOKEN to registry");
             }
+        } else {
+            println!("DEBUG: Failed to open registry key for HUGGINGFACE_TOKEN");
         }
 
         unsafe {
@@ -277,15 +311,40 @@ fn set_hf_token(token: String, cfg: tauri::State<'_, AppConfig>) -> Result<(), S
                 None,
             );
         }
+        println!("DEBUG: Broadcasted environment change");
     }
     Ok(())
 }
 
 #[tauri::command]
 fn get_hf_token(cfg: tauri::State<'_, AppConfig>) -> Option<String> {
-    if let Ok(guard) = cfg.hf_token.lock() {
-        return guard.clone();
+    // First try to get from environment variable
+    if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
+        if !token.trim().is_empty() {
+            println!("DEBUG: Found HUGGINGFACE_TOKEN in environment: {}", &token[..std::cmp::min(10, token.len())]);
+            // Update AppConfig to match environment variable
+            if let Ok(mut guard) = cfg.hf_token.lock() {
+                *guard = Some(token.clone());
+            }
+            return Some(token);
+        } else {
+            println!("DEBUG: HUGGINGFACE_TOKEN is empty");
+        }
+    } else {
+        println!("DEBUG: HUGGINGFACE_TOKEN not found in environment");
     }
+    
+    // If not in environment, try AppConfig
+    if let Ok(guard) = cfg.hf_token.lock() {
+        if let Some(token) = guard.clone() {
+            println!("DEBUG: Found HUGGINGFACE_TOKEN in AppConfig: {}", &token[..std::cmp::min(10, token.len())]);
+            return Some(token);
+        } else {
+            println!("DEBUG: No HUGGINGFACE_TOKEN in AppConfig");
+        }
+    }
+    
+    println!("DEBUG: No HUGGINGFACE_TOKEN found anywhere");
     None
 }
 
@@ -464,7 +523,7 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
         images.iter().cloned().collect::<Vec<String>>()
     };
 
-    // Step 1: Use Gemini 2.0 Flash for content extraction
+    // Step 1: Use Gemini 2.0 Flash for content extraction (with 1.5 Flash fallback)
     let client = Client::default();
     let mut content_parts = vec![ContentPart::from_text(prompt)];
 
@@ -483,11 +542,28 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
         ChatMessage::user(content_parts),
     ]);
 
-    // Use Gemini 2.0 Flash for extraction
-    let extraction_result = client
-        .exec_chat("gemini-2.0-flash", chat_req, None)
+    // Use Gemini 2.0 Flash specifically for BEAST MODE extraction
+    let extraction_result = match client
+        .exec_chat("gemini-2.0-flash", chat_req.clone(), None)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // If gemini-2.0-flash fails, try gemini-1.5-flash as fallback
+            match client
+                .exec_chat("gemini-1.5-flash", chat_req, None)
+                .await
+            {
+                Ok(result) => result,
+                Err(fallback_e) => {
+                    return Err(format!(
+                        "## BEAST MODE EXTRACTION FAILED! ❌\n\n**Error:** Failed to extract content from images.\n\n**Primary Error:** {}\n**Fallback Error:** {}\n\n**Note:** Please check your Gemini API key and internet connection, then try again.",
+                        e, fallback_e
+                    ));
+                }
+            }
+        }
+    };
 
     let extracted_content = extraction_result
         .content_text_as_str()
@@ -506,8 +582,8 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
             extracted_content
         );
 
-        // Use a more reliable model endpoint
-        let model_endpoint = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-large";
+        // Use GPT-OSS-120B via Hugging Face Router API (OpenAI-compatible format)
+        let model_endpoint = "https://router.huggingface.co/v1/chat/completions";
         
         let gpt_response = match http_client
             .post(model_endpoint)
@@ -515,14 +591,16 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
             .header("Content-Type", "application/json")
             .timeout(std::time::Duration::from_secs(120)) // 2 minute timeout
             .json(&json!({
-                "inputs": final_prompt,
-                "parameters": {
-                    "max_new_tokens": 2048,
-                    "temperature": 0.7,
-                    "return_full_text": false,
-                    "do_sample": true,
-                    "top_p": 0.9
-                }
+                "model": "openai/gpt-oss-120b",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": final_prompt
+                    }
+                ],
+                "max_tokens": 8192,
+                "temperature": 1.0,
+                "top_p": 0.7
             }))
             .send()
             .await
@@ -531,24 +609,26 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
                         Ok(json) => {
-                            // Handle Hugging Face API response format
-                            if let Some(choices) = json.as_array() {
+                            // Handle OpenAI-compatible response format
+                            if let Some(choices) = json["choices"].as_array() {
                                 if let Some(first_choice) = choices.first() {
-                                    if let Some(text) = first_choice["generated_text"].as_str() {
-                                        text.to_string()
+                                    if let Some(message) = first_choice["message"].as_object() {
+                                        if let Some(content) = message["content"].as_str() {
+                                            content.to_string()
+                                        } else {
+                                            "No content in message".to_string()
+                                        }
                                     } else {
-                                        "No generated text in response".to_string()
+                                        "No message in choice".to_string()
                                     }
                                 } else {
-                                    "Empty response from AI model".to_string()
+                                    "Empty choices array from Beast Model".to_string()
                                 }
-                            } else if let Some(text) = json["generated_text"].as_str() {
-                                text.to_string()
                             } else {
-                                "Unexpected response format from AI model".to_string()
+                                "No choices in Beast Model response".to_string()
                             }
                         }
-                        Err(e) => format!("Error parsing AI model response: {}", e)
+                        Err(e) => format!("Error parsing model response: {}", e)
                     }
                 } else {
                     let status = response.status();
@@ -557,23 +637,28 @@ async fn call_beast_mode(prompt: String, queue: tauri::State<'_, ImageQueue>, cf
                     // Handle specific error cases
                     if status == 503 {
                         format!(
-                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Advanced AI processing is temporarily unavailable (Service Unavailable). The extracted content above contains all the information from your images. You can use this content directly or try again later.",
+                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Beast Model is temporarily unavailable (Service Unavailable). The extracted content above contains all the information from your images. You can use this content directly or try again later.",
                             extracted_content
                         )
                     } else if status == 400 {
                         format!(
-                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Advanced AI processing request format error (Bad Request). The extracted content above contains all the information from your images. You can use this content directly.",
+                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Beast Model request format error (Bad Request). The extracted content above contains all the information from your images. You can use this content directly.",
+                            extracted_content
+                        )
+                    } else if status == 404 {
+                        format!(
+                            "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Beast model not found (404). The extracted content above contains all the information from your images. You can use this content directly.",
                             extracted_content
                         )
                     } else {
-                        format!("AI model API error ({}): {}", status, error_text)
+                        format!("Beast Model API error ({}): {}", status, error_text)
                     }
                 }
             }
             Err(e) => {
                 // Handle network errors gracefully
                 format!(
-                    "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Network error occurred while connecting to advanced AI processing: {}. The extracted content above contains all the information from your images. You can use this content directly or check your internet connection and try again.",
+                    "## BEAST MODE EXTRACTION COMPLETE! 🚀\n\n**Extracted Content:**\n{}\n\n**Note:** Network error occurred while connecting to the Beast Model: {}. The extracted content above contains all the information from your images. You can use this content directly or check your internet connection and try again.",
                     extracted_content, e
                 )
             }
@@ -630,7 +715,35 @@ async fn main() {
             // Initialize runtime configuration
             let initial_model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
             let initial_key = std::env::var("GEMINI_API_KEY").ok();
-            let initial_hf_token = std::env::var("HUGGINGFACE_TOKEN").ok();
+            let mut initial_hf_token = std::env::var("HUGGINGFACE_TOKEN").ok();
+            
+            println!("DEBUG: Startup - GEMINI_API_KEY present: {}", initial_key.is_some());
+            println!("DEBUG: Startup - HUGGINGFACE_TOKEN present: {}", initial_hf_token.is_some());
+            if let Some(ref token) = initial_hf_token {
+                println!("DEBUG: Startup - HUGGINGFACE_TOKEN value: {}", &token[..std::cmp::min(10, token.len())]);
+            }
+            
+            // Check what's actually in the Windows registry and load if needed
+            #[cfg(windows)]
+            {
+                let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+                if let Ok(env) = hkcu.open_subkey_with_flags("Environment", winreg::enums::KEY_READ) {
+                    if let Ok(reg_token) = env.get_value::<String, _>("HUGGINGFACE_TOKEN") {
+                        println!("DEBUG: Registry - HUGGINGFACE_TOKEN found: {}", &reg_token[..std::cmp::min(10, reg_token.len())]);
+                        // Load the token from registry into environment if not already present
+                        if initial_hf_token.is_none() {
+                            std::env::set_var("HUGGINGFACE_TOKEN", &reg_token);
+                            initial_hf_token = Some(reg_token);
+                            println!("DEBUG: Loaded HUGGINGFACE_TOKEN from registry into environment");
+                        }
+                    } else {
+                        println!("DEBUG: Registry - HUGGINGFACE_TOKEN not found in registry");
+                    }
+                } else {
+                    println!("DEBUG: Registry - Failed to open registry key for reading");
+                }
+            }
+            
             app.manage(AppConfig {
                 api_key: Mutex::new(initial_key),
                 model: Mutex::new(initial_model),
