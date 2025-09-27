@@ -75,5 +75,3 @@ cd interview_helper
 - Backend: Rust + Tauri 2
 - Markdown rendering: `react-markdown`
 
-## License
-MIT
