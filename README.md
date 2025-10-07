@@ -40,9 +40,14 @@ React + Tauri desktop app that captures screenshots and sends them to a Gemini m
 git clone <your-repo-url>
 cd interview_helper
 
-# install deps
+# install npm dependencies
    npm install
 # or: bun install
+
+# install rust dependencies
+   cd src-tauri
+   cargo build
+   cd ..
 
 # set env (create src-tauri/.env)
 # GEMINI_API_KEY=your_key
