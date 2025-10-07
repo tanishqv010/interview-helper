@@ -208,15 +208,15 @@ export default function App() {
           handleClearQueue();
         });
         await register("CommandOrControl+Shift+]", () => {
-          setOpacity((prev) => Math.min(0.9, Math.round((prev + 0.05) * 20) / 20));
+          setOpacity((prev) => Math.min(0.8, Math.round((prev + 0.05) * 20) / 20));
         });
         await register("CommandOrControl+Shift+[", () => {
-          setOpacity((prev) => Math.max(0.1, Math.round((prev - 0.05) * 20) / 20));
+          setOpacity((prev) => Math.max(0.0, Math.round((prev - 0.05) * 20) / 20));
         });
         await register("CommandOrControl+Shift+B", async () => {
           try {
             const visible = await invoke<boolean>("toggle_window_visibility");
-            setOpacity(visible ? 0.9 : 0.1);
+            setOpacity(visible ? 0.8 : 0.0);
           } catch (e) {
             console.error("Toggle visibility failed", e);
           }
